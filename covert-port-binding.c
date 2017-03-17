@@ -32,18 +32,19 @@ Tested under CentOS 7.2.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/types.h> 
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <sched.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <unistd.h>
 
 #define STREAM_LEN 1024 * 8 * 128 /* test stream length (128 kilobytes) */
-
-struct sockaddr_in addr;
+#define MAX_ADDR 16 /* transmit 16 bits per switch */
+struct sockaddr_in addr[MAX_ADDR];;
 char test_stream[STREAM_LEN];
 
 static inline long double
@@ -62,25 +63,36 @@ error(const char *msg)
 static void
 sender_handler(int sig)
 {
+	int i;
 	static int counter = 0;
-	static int sock_sender = -1;
+	static int sock_sender[MAX_ADDR] = {-1};
 
-	if(sock_sender > 0)
-		close(sock_sender);
-	sock_sender = -1;
-	if (counter >= STREAM_LEN) return;
-	/* if test stream contains non-zero bit, bind specified port */
-	if(test_stream[counter])
+	for(i = 0; i < MAX_ADDR; i++)
 	{
-		sock_sender = socket(AF_INET, SOCK_STREAM, 0);
-		if(sock_sender < 0) 
-			error("ERROR opening socket");
-		
-		if(bind(sock_sender, (struct sockaddr *) &addr, sizeof(addr)) < 0)
-			error("ERROR on binding");
+		if(sock_sender[i] > 0)
+			close(sock_sender[i]);
+		sock_sender[i] = -1;
+		if (counter >= STREAM_LEN)
+		{
+			sched_yield();
+			return;
+		}
+		/* if test stream contains non-zero bit, bind specified port */
+		if(test_stream[counter])
+		{
+			sock_sender[i] = socket(AF_INET, SOCK_STREAM, 0);
+			if(sock_sender[i] < 0) 
+			{
+				error("ERROR opening socket (sender)");
+			}
+			if(bind(sock_sender[i], (struct sockaddr *) &(addr[i]), sizeof(addr[i])) < 0)
+			{
+				error("ERROR on binding (sender)");
+			}
+		}
+		counter++;
 	}
 	sched_yield();
-	counter++;
 }
 
 static void
@@ -114,23 +126,26 @@ do_receiver(pid_t sender_pid)
 	{
 		kill(sender_pid, SIGUSR1);
 		sched_yield();
-		sock_receiver = socket(AF_INET, SOCK_STREAM, 0);
-		if(sock_receiver < 0) 
-		{
-			error("ERROR opening socket");
-		}
 
 		/* check if we can bind specified port. If we cant't, sender set a bit 1 */
-		if(bind(sock_receiver, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+		for(i = 0; i < MAX_ADDR; i++)
 		{
-			stream[counter] = 1;
+			sock_receiver = socket(AF_INET, SOCK_STREAM, 0);
+			if(sock_receiver < 0) 
+			{
+				error("ERROR opening socket (receiver)");
+			}
+			if(bind(sock_receiver, (struct sockaddr *) &addr[i], sizeof(addr[i])) < 0)
+			{
+				stream[counter] = 1;
+			}
+			else
+			{
+				stream[counter] = 0;
+			}
+			counter++;
+			close(sock_receiver);
 		}
-		else
-		{
-			stream[counter] = 0;
-		}
-		counter++;
-		close(sock_receiver);
 	}
 
 	gettimeofday(&tv, NULL);
@@ -151,6 +166,8 @@ do_receiver(pid_t sender_pid)
 		fprintf(stderr, "Wrong stream!\n");
 		for(i = 0; i < 1024; i++)
 		{
+			if(i % 64 == 0)
+				putc('\n', stderr);
 			if(stream[i] != test_stream[i])
 			{
 				fprintf(stderr, "\033[1;31m");
@@ -163,7 +180,7 @@ do_receiver(pid_t sender_pid)
 		}
 		putc('\n', stderr);
 	}
-	printf("Errors: %d, noise: %d%\n", errors, errors * 100 / bits);
+	printf("Errors: %d, noise: %d%%\n", errors, errors * 100 / bits);
 	kill(sender_pid, SIGKILL);
 }
 
@@ -176,11 +193,6 @@ void set_cpu()
 
 	/* use only first CPU in system to avoid multi-core architecture impact */
 	sched_setaffinity(0, sizeof(cpu_set_t), &my_set);
-
-	/* set RR scheduler */
-	struct sched_param schedparam;
-	schedparam.sched_priority = 80;
-	sched_setscheduler(getpid(), SCHED_RR, &schedparam);
 }
 
 int main(int argc, char *argv[])
@@ -188,13 +200,16 @@ int main(int argc, char *argv[])
 	/* pick a random port */
 	const int port = 63964;
 	pid_t sender_pid;
-	int i;
+	int i, status;
 
-	/* initialize socket address */
-	bzero((char *) &addr, sizeof(addr));
-	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = INADDR_ANY;
-	addr.sin_port = htons(port);
+	/* initialize socket addresses */
+	for(i = 0; i < MAX_ADDR; i++)
+	{
+		bzero((char *) &addr[i], sizeof(addr[i]));
+		addr[i].sin_family = AF_INET;
+		addr[i].sin_addr.s_addr = htons(INADDR_LOOPBACK + i);
+		addr[i].sin_port = htons(port);
+	}
 
 	/* generate test stream */
 	for(i = 0; i < STREAM_LEN; i++)
@@ -212,7 +227,7 @@ int main(int argc, char *argv[])
 		default:
 			set_cpu();
 			do_receiver(sender_pid);
-			wait();
+			wait(&status);
 	}
 
 	return 0; 
